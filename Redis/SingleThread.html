@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Single-Threaded Event Loop — Quick Guide</title>
+<style>
+  :root { color-scheme: light; --ink:#172033; --muted:#5d687b; --line:#dce3ec; --blue:#e8f2ff; --green:#e7f7ed; --amber:#fff3d9; --panel:#f6f8fb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:var(--ink); background:#f3f6fa; }
+  main { max-width:900px; margin:0 auto; padding:28px 18px 50px; }
+  h1 { line-height:1.2; font-size:clamp(1.8rem,4vw,2.5rem); margin:.2em 0; }
+  h2 { margin:1.6em 0 .5em; font-size:1.3rem; }
+  p { margin:.5em 0 1em; }
+  .sub { color:var(--muted); }
+  .hero,.card { background:white; border:1px solid var(--line); border-radius:16px; padding:20px; margin:16px 0; }
+  .flow { display:grid; gap:10px; margin:18px 0; }
+  .step { padding:14px 16px; border-radius:12px; border:1px solid var(--line); }
+  .client { background:var(--blue); }
+  .os { background:var(--panel); }
+  .mainthread { background:var(--green); border:2px solid #9bd7ad; }
+  .response { background:var(--amber); }
+  .arrow { text-align:center; font-size:1.4rem; color:var(--muted); line-height:1; }
+  .step strong { display:block; margin-bottom:3px; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+  code { background:#edf1f6; padding:.12em .35em; border-radius:5px; }
+  pre { background:#101827; color:#eaf0fb; padding:18px; border-radius:12px; overflow:auto; line-height:1.65; }
+  .note { border-left:4px solid #4c83d8; padding:10px 14px; background:#edf4ff; border-radius:0 10px 10px 0; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+  .grid .card { margin:0; }
+  ul { padding-left:1.3rem; }
+  li { margin:.35em 0; }
+  footer { color:var(--muted); font-size:.9rem; margin-top:28px; }
+  @media print { body { background:white; } main { max-width:none; padding:0; } .hero,.card { break-inside:avoid; } }
+</style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <p class="sub">Redis internals · Quick reference</p>
+    <h1>Single-Threaded Event Loop</h1>
+    <p><strong>Core idea:</strong> Redis executes ordinary commands sequentially on its main thread. It does not wait for each client’s network transmission to finish; the OS and socket buffers handle much of the network waiting.</p>
+  </section>
+
+  <h2>1. The critical loop</h2>
+  <pre>while Redis is running:
+    collect ready socket events
+
+    for each connection that needs attention:
+        read available bytes
+        parse complete command(s)
+        execute command(s) on the main thread
+        put response bytes in the output buffer
+
+        if the socket can accept data:
+            write pending response bytes
+
+    return to the event loop</pre>
+  <p class="note"><strong>Important:</strong> This is simplified pseudocode, not Redis’s literal source code. Real Redis also handles timers, client state, incomplete commands, pending writes, and other server work.</p>
+
+  <h2>2. What happens, in order?</h2>
+  <div class="flow">
+    <div class="step client"><strong>1 · Client sends a command</strong><code>GET user:123</code> travels over TCP.</div>
+    <div class="arrow">↓</div>
+    <div class="step os"><strong>2 · OS receives network data</strong>TCP/socket buffers can hold bytes while Redis is busy with another command.</div>
+    <div class="arrow">↓</div>
+    <div class="step os"><strong>3 · Event loop notices readiness</strong>The OS notifies Redis which sockets are ready to read or write. Redis need not continuously poll every idle connection.</div>
+    <div class="arrow">↓</div>
+    <div class="step mainthread"><strong>4 · Main thread reads and parses</strong>Redis reads available bytes. If the command is incomplete, it waits for more data; it cannot execute a partial command.</div>
+    <div class="arrow">↓</div>
+    <div class="step mainthread"><strong>5 · Main thread executes</strong>For <code>GET user:123</code>, Redis looks up the key in memory and obtains the result.</div>
+    <div class="arrow">↓</div>
+    <div class="step response"><strong>6 · Prepare and send the reply</strong>Redis encodes the result and buffers it. It writes bytes when the socket can accept them; remaining bytes can wait for a later writable event.</div>
+    <div class="arrow">↓</div>
+    <div class="step client"><strong>7 · Continue with ready work</strong>The event loop handles other ready connections or buffered commands, then waits for/collects more events as needed.</div>
+  </div>
+
+  <h2>3. Where do other requests wait?</h2>
+  <div class="grid">
+    <div class="card"><strong>OS / TCP receive buffer</strong><p>Incoming bytes received from the network but not yet read by Redis.</p></div>
+    <div class="card"><strong>Redis input buffer</strong><p>Bytes Redis has read, possibly containing a partial command or several commands.</p></div>
+    <div class="card"><strong>Redis output buffer</strong><p>Response bytes prepared but not yet fully written to the socket.</p></div>
+  </div>
+  <p>There is not necessarily one giant central queue containing every client request. Waiting data can exist at different stages. All buffers are finite; if Redis falls behind, latency and memory use can rise, and clients may eventually time out or disconnect.</p>
+
+  <h2>4. Why can one thread be so fast?</h2>
+  <ul>
+    <li><strong>In-memory data:</strong> common reads and writes avoid disk access for each operation.</li>
+    <li><strong>Less synchronization:</strong> sequential command execution avoids much of the locking needed when multiple threads modify shared data structures.</li>
+    <li><strong>Event-driven I/O:</strong> many connections can be monitored without one thread per client or repeated checks of every idle socket.</li>
+    <li><strong>Small per-command work:</strong> many commands are simple and complete quickly.</li>
+    <li><strong>Pipelining:</strong> clients can send several commands without waiting for a round trip after each one.</li>
+  </ul>
+
+  <h2>5. The mental model</h2>
+  <div class="card">
+    <p><strong>Main thread:</strong> read → parse complete command → execute → prepare reply.</p>
+    <p><strong>Event loop / OS:</strong> identify ready sockets; network buffers absorb some waiting; send replies when possible.</p>
+    <p><strong>Then:</strong> process other ready work. Command execution is sequential, while network activity for different clients can overlap.</p>
+  </div>
+  <p class="note"><strong>Limit:</strong> A long-running command or script can block the main command thread and delay other commands. Single-threaded does not mean unlimited throughput, nor does it mean commands run in parallel.</p>
+
+  <footer>Redis version and configuration affect networking details. This guide describes the core mental model rather than every implementation detail.</footer>
+</main>
+</body>
+</html>
